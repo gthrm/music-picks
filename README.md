@@ -31,6 +31,10 @@ Sibling of [movie-picks](https://github.com/gthrm/movie-picks): same flow, music
    5 minutes, and Lidarr also searches torrents through Prowlarr → qBittorrent.
    The page shows Soulseek/torrent progress. Quality: MP3 V0/256/320, AAC 256+ or lossless.
 
+5. **Watcher** (`watch`, every 15 min): albums that are wanted but not downloading get an
+   artist-level search (at most once per artist per 12 h). Lidarr's album search ignores
+   discography packs, often the only torrent of an older album; artist search takes them.
+
 ## Layout
 
 ```
@@ -64,7 +68,7 @@ deploy/                 systemd units and timer
 5. Web handler and the daily timer:
    ```sh
    sudo cp deploy/* /etc/systemd/system/ && sudo systemctl daemon-reload
-   sudo systemctl enable --now music-picks-web.service
+   sudo systemctl enable --now music-picks-web.service music-picks-watch.timer
    python3 app/music_picks.py pick --dry-run   # writes state/last_email.html
    sudo systemctl enable --now music-picks.timer
    ```

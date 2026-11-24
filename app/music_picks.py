@@ -6,6 +6,7 @@
   music_picks.py sync               pull taste from Spotify into Postgres
   music_picks.py pick [--dry-run]   build today's picks and email them
   music_picks.py serve              run the download-link web handler
+  music_picks.py watch              artist-level search for wanted albums nothing has found (timer, 15 min)
 """
 import datetime as dt
 import hashlib
@@ -737,6 +738,47 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(502, "<h1>Could not add the album to Lidarr</h1>")
 
 
+ARTIST_SEARCH_HOURS = 12   # at most one artist-level search per artist in this window
+WATCH_GRACE_MIN = 20       # give the album's own search and Soularr a head start
+
+
+def cmd_watch():
+    """Albums that are wanted but not downloading: run an artist-level search. Lidarr's album search
+    ignores discography packs, which is often the only torrent of an older album; artist search takes
+    them. Throttled per artist via music_events (kind 'artist_search')."""
+    now = dt.datetime.now(dt.timezone.utc)
+
+    def age_s(iso):
+        try:
+            return (now - dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))).total_seconds()
+        except (AttributeError, ValueError):
+            return 1e9
+
+    wanted = (lidarr("GET", "/wanted/missing?pageSize=1000&monitored=true&includeArtist=true") or {}).get("records", [])
+    queued = {r.get("albumId") for r in (lidarr("GET", "/queue?pageSize=1000") or {}).get("records", [])}
+    todo = {}
+    for a in wanted:
+        if a["id"] in queued or age_s(a.get("releaseDate")) < 0:   # downloading, or not released yet
+            continue
+        if age_s(a.get("lastSearchTime")) < WATCH_GRACE_MIN * 60:
+            continue
+        art = a.get("artist") or {}
+        todo.setdefault(art.get("foreignArtistId"), (a["artistId"], art.get("artistName"), []))[2].append(a["title"])
+    todo.pop(None, None)
+    if not todo:
+        return   # nothing stuck: don't wake the database
+    with db() as c:
+        recent = {r[0] for r in c.execute(
+            "select mbid from music_events where kind = 'artist_search' and at > now() - make_interval(hours => %s)",
+            (ARTIST_SEARCH_HOURS,))}
+    for mbid, (artist_id, name, titles) in todo.items():
+        if mbid in recent:
+            continue
+        log(f"artist search: {name} (missing: {', '.join(titles[:5])})")
+        lidarr("POST", "/command", {"name": "ArtistSearch", "artistId": artist_id})
+        event(mbid, "artist_search", artist=name, albums=titles)
+
+
 def cmd_serve():
     sign("check", 0)   # fail at startup, not per request, if LINK_SECRET is bad
     port = int(CFG["WEB_PORT"])
@@ -750,6 +792,8 @@ if __name__ == "__main__":
         cmd_serve()
     elif cmd == "login":
         os.execv(str(VENV_PY), [str(VENV_PY), "-I", str(ROOT / "app" / "spotify_browser.py"), "login"])
+    elif cmd == "watch":
+        cmd_watch()
     elif cmd == "sync":
         sync_spotify()
     elif cmd == "pick":

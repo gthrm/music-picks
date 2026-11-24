@@ -1,0 +1,10 @@
+[Unit]
+Description=music-picks: artist-level search for albums no torrent/Soulseek search has found
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/home/user/music-picks
+ExecStart=/usr/bin/python3 -I /home/user/music-picks/app/music_picks.py watch
