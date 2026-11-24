@@ -8,11 +8,13 @@ Sibling of [movie-picks](https://github.com/gthrm/movie-picks): same flow, music
 ## How it works
 
 1. **Sync taste** (`sync`, also at the start of every `pick`): no Spotify developer app (those need
-   Premium since 2026). A headless Chromium logged in to open.spotify.com once
-   (`app/spotify_browser.py`, profile in `state/browser`) hands over the web player's own access
-   token, and the Web API is called with it: top artists
-   (4 weeks / 6 months / all time), top tracks, saved albums, saved tracks, followed
-   artists and recent plays go into Postgres (`music_artists`, `music_albums`).
+   Premium since 2026), no API calls, no token. A headless Chromium logged in to open.spotify.com
+   once (`app/spotify_browser.py harvest`, profile in `state/browser`) opens the web player pages
+   and reads the JSON the player itself fetches: the library sidebar (saved albums, followed
+   artists, own playlists), `/user/<id>/top/artists` and `/top/tracks`, Liked Songs, your own
+   playlists and the "Your Top Songs" ones. `sync` turns that into `music_artists` and
+   `music_albums` in Postgres. The web UI only shows top data for the last ~4 weeks, so liked
+   songs, own playlists and the library carry the long-term taste.
 2. **Pick** (`app/selection.py`), diversity-first:
    - top artists are split once into distinct taste *facets* (rebuilt every 3 weeks
      or when the top artists shift);
@@ -22,7 +24,8 @@ Sibling of [movie-picks](https://github.com/gthrm/movie-picks): same flow, music
    - each candidate is resolved on MusicBrainz via Lidarr. Saved/known albums, albums
      already sent or already in Lidarr, compilations and live albums are dropped;
    - at most 1 album a day by an artist already in your Spotify.
-3. **Email**: cover, why-you'd-like-it, a Spotify link and a signed download link (HMAC, 60 days).
+3. **Email**: cover, why-you'd-like-it, a Spotify link (a Spotify search for "artist album")
+   and a signed download link (HMAC, 60 days).
 4. **Download page** (`serve`): *Download* adds the album to Lidarr (artist is not
    monitored for anything else). **Soularr** feeds it to **slskd** (Soulseek) every
    5 minutes, and Lidarr also searches torrents through Prowlarr → qBittorrent.
@@ -32,7 +35,7 @@ Sibling of [movie-picks](https://github.com/gthrm/movie-picks): same flow, music
 
 ```
 app/music_picks.py      CLI: login | sync | pick | serve; Spotify, Lidarr, email, web handler
-app/spotify_browser.py  headless Chromium (Playwright): one-time login, web-player token
+app/spotify_browser.py  headless Chromium (Playwright): one-time login, harvest of web-player pages
 app/selection.py        facets, prompt, sampling and filters
 setup/configure_arr.py  one-time Lidarr/Prowlarr/Soularr setup
 docker-compose.yml      Lidarr, slskd, Soularr (on the shared "media" network)

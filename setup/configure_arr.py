@@ -79,6 +79,26 @@ if not meta:
 (STATE / "lidarr_metadata_id").write_text(str(meta["id"]))
 print("metadata profile ok", meta["id"])
 
+# --- naming: Artist/Album (Year)/NN - Title ---
+naming = lidarr("GET", "/config/naming")
+naming.update(renameTracks=True, standardTrackFormat="{Album Title} ({Release Year})/{track:00} - {Track Title}",
+              multiDiscTrackFormat="{Album Title} ({Release Year})/{medium:00}-{track:00} - {Track Title}")
+lidarr("PUT", f"/config/naming/{naming['id']}", naming)
+print("naming ok")
+
+# --- audio tags with embedded cover art ---
+mp = lidarr("GET", "/config/metadataprovider")
+mp.update(writeAudioTags="allFiles", embedCoverArt=True, scrubAudioTags=False)
+lidarr("PUT", f"/config/metadataprovider/{mp['id']}", mp)
+print("tags ok")
+
+# --- cover.jpg / folder.jpg next to tracks for players (Kodi/Emby metadata consumer) ---
+kodi = next((m for m in lidarr("GET", "/metadata") if m["name"] == "Kodi (XBMC) / Emby"), None)
+if kodi and not kodi["enable"]:
+    kodi["enable"] = True
+    lidarr("PUT", f"/metadata/{kodi['id']}", kodi)
+print("cover images ok")
+
 # --- root folder ---
 if not any(r["path"] == "/media/music" for r in lidarr("GET", "/rootfolder")):
     lidarr("POST", "/rootfolder", {"name": "Music", "path": "/media/music", "defaultQualityProfileId": prof["id"],
@@ -108,6 +128,16 @@ if PK_FILE.exists():
         s.update(name="Lidarr", syncLevel="fullSync")
         call(P, PK, "POST", "/applications", s)
     print("prowlarr app ok")
+
+    # FlareSolverr proxy for Cloudflare-protected indexers (tag "flaresolverr" on those indexers)
+    tag = next((t for t in call(P, PK, "GET", "/tag") if t["label"] == "flaresolverr"), None) \
+        or call(P, PK, "POST", "/tag", {"label": "flaresolverr"})
+    if not any(x["implementation"] == "FlareSolverr" for x in call(P, PK, "GET", "/indexerproxy")):
+        s = next(x for x in call(P, PK, "GET", "/indexerproxy/schema") if x["implementation"] == "FlareSolverr")
+        fill(s, {"host": "http://172.31.77.16:8191/", "requestTimeout": 120})
+        s.update(name="FlareSolverr", tags=[tag["id"]])
+        call(P, PK, "POST", "/indexerproxy", s)
+    print("flaresolverr proxy ok, tag", tag["id"])
 else:
     print("no prowlarr key at", PK_FILE, "- skipping")
 
@@ -125,8 +155,8 @@ host_url = http://{SLSKD_IP}:5030
 url_base = /
 download_dir = /media/slskd
 delete_searches = False
-stalled_timeout = 3600
-remote_queue_timeout = 600
+stalled_timeout = 900
+remote_queue_timeout = 300
 
 [Release Settings]
 use_most_common_tracknum = True
@@ -146,7 +176,7 @@ search_for_tracks = True
 album_prepend_artist = True
 track_prepend_artist = True
 search_type = incrementing_page
-number_of_albums_to_grab = 10
+number_of_albums_to_grab = 25
 remove_wanted_on_failure = False
 title_blacklist =
 search_blacklist =
@@ -162,4 +192,5 @@ level = INFO
 log_to_file = False
 """)
 cfg.chmod(0o600)
+os.system(f"setfacl -m u:1000:r {cfg} 2>/dev/null")   # soularr runs as uid 1000
 print("soularr config ok")

@@ -17,6 +17,7 @@ import pathlib
 import re
 import smtplib
 import subprocess
+import threading
 import sys
 import time
 import unicodedata
@@ -51,16 +52,16 @@ def load_env():
     env.setdefault("LIDARR_URL", "http://127.0.0.1:8686")
     env.setdefault("SLSKD_URL", "http://127.0.0.1:5030")
     env.setdefault("CLAUDE_MODEL", "opus")
-    env.setdefault("PICKS_PER_DAY", "3")
     env.setdefault("SMTP_HOST", "smtp.gmail.com")
     env.setdefault("SMTP_PORT", "465")
     env.setdefault("WEB_PORT", "8791")
     env.setdefault("MAIL_NAME", "Music Picks")
-    env["LIDARR_KEY"] = (STATE / "lidarr.key").read_text().strip()
-    env["LIDARR_PROFILE"] = (STATE / "lidarr_profile_id").read_text().strip()
-    env["LIDARR_METADATA"] = (STATE / "lidarr_metadata_id").read_text().strip()
-    p = STATE / "slskd.key"
-    env["SLSKD_KEY"] = p.read_text().strip() if p.exists() else ""
+    for k, f in (("LIDARR_KEY", "lidarr.key"), ("LIDARR_PROFILE", "lidarr_profile_id"),
+                 ("LIDARR_METADATA", "lidarr_metadata_id"), ("SLSKD_KEY", "slskd.key")):
+        p = STATE / f
+        if not p.exists() and k != "SLSKD_KEY":
+            raise SystemExit(f"missing {p}: run setup/configure_arr.py first (see README)")
+        env[k] = p.read_text().strip() if p.exists() else ""
     return env
 
 
@@ -72,10 +73,11 @@ def log(*a):
 
 
 def norm(s):
-    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
-    s = s.replace("&", "and")
+    """Lowercase, accents stripped, punctuation dropped; non-Latin letters (Cyrillic, CJK…) are kept."""
+    s = unicodedata.normalize("NFKD", s or "").casefold()
+    s = "".join(c for c in s if not unicodedata.combining(c)).replace("&", "and")
     s = re.sub(r"\((deluxe|remaster|expanded|anniversary|bonus)[^)]*\)|\[[^\]]*\]", "", s)
-    return re.sub(r"[^a-z0-9]+", "", s)
+    return re.sub(r"[\W_]+", "", s)
 
 
 def akey(artist, title):
@@ -95,6 +97,9 @@ create table if not exists music_sent (
   mbid text not null, artist text, title text, year int, facet text, why text, genres text[],
   known_artist boolean, recipients text[]);
 create index if not exists music_sent_mbid on music_sent(mbid);
+create table if not exists music_tracks (
+  uri text not null, source text not null, list_name text, artist_id text, artist text, album_id text,
+  album text, year int, album_type text, seen_at timestamptz default now(), primary key (uri, source));
 create table if not exists music_events (
   id bigserial primary key, at timestamptz default now(), mbid text not null, kind text not null, detail jsonb);
 """
@@ -140,146 +145,102 @@ def slskd(path):
 
 
 # ---------------------------------------------------------------- Spotify
-# No developer app: a headless Chromium logged in to open.spotify.com (spotify_browser.py, in .venv with
-# Playwright) hands over the web player's own access token; the Web API is then called with it.
-TOKEN_FILE = STATE / "spotify_web_token.json"
+# No developer app, no API calls: spotify_browser.py (in .venv with Playwright) opens the web player pages in
+# a logged-in headless Chromium and returns the JSON the player itself fetched.
 VENV_PY = ROOT / ".venv" / "bin" / "python"
 
 
-def spotify_access_token(force=False):
-    if not force and TOKEN_FILE.exists():
-        t = json.loads(TOKEN_FILE.read_text())
-        if t.get("expires_at", 0) > time.time() + 60:
-            return t["token"]
-    out = subprocess.run([str(VENV_PY), "-I", str(ROOT / "app" / "spotify_browser.py"), "token"],
-                         capture_output=True, text=True, timeout=300)
+def spotify_harvest(hint):
+    out = subprocess.run([str(VENV_PY), "-I", str(ROOT / "app" / "spotify_browser.py"), "harvest"],
+                         input=json.dumps(hint), capture_output=True, text=True, timeout=1800)
+    for line in out.stderr.strip().splitlines()[-6:]:
+        log("spotify:", line)
     if out.returncode != 0:
-        raise RuntimeError(f"spotify token: {(out.stderr or out.stdout).strip()[-500:]}")
-    t = json.loads(out.stdout.strip().splitlines()[-1])
-    tmp = TOKEN_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(t))
-    tmp.chmod(0o600)
-    tmp.replace(TOKEN_FILE)
-    return t["token"]
-
-
-def spotify(path, params=None):
-    url = path if path.startswith("https://") else "https://api.spotify.com/v1" + path
-    if params:
-        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
-    force = False
-    for attempt in range(5):
-        try:
-            return http_json(url, headers={"Authorization": "Bearer " + spotify_access_token(force)})
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and not force:
-                force = True
-                continue
-            if e.code == 429 and attempt < 4:
-                time.sleep(min(int(e.headers.get("Retry-After") or 5), 60))
-                continue
-            raise
-
-
-def spotify_pages(path, params, max_items, key=None):
-    out, page = [], spotify(path, params)
-    while page:
-        body = page[key] if key else page
-        out += body.get("items") or []
-        if len(out) >= max_items or not body.get("next"):
-            break
-        page = spotify(body["next"])
-    return out[:max_items]
+        raise RuntimeError(f"spotify harvest failed: {out.stderr.strip()[-500:]}")
+    return json.loads(out.stdout)
 
 
 def spotify_album_url(artist, title):
-    """Direct album link via search; falls back to a search URL."""
-    try:
-        res = spotify("/search", {"q": f"album:{title} artist:{artist}", "type": "album", "limit": 5})
-        for a in res["albums"]["items"]:
-            if any(norm(x["name"]) == norm(artist) for x in a["artists"]) and (
-                    norm(a["name"]) == norm(title) or norm(a["name"]).startswith(norm(title))):
-                return a["external_urls"]["spotify"]
-    except Exception as e:  # noqa: BLE001
-        log("spotify search failed:", e)
     return "https://open.spotify.com/search/" + urllib.parse.quote(f"{artist} {title}")
 
 
+TRACK_COLS = "uri, source, list_name, artist_id, artist, album_id, album, year, album_type"
+
+
+def track_row(t, source, list_name=None):
+    al = t.get("album") or {}
+    return (t["uri"], source, list_name, t["artist"]["id"], t["artist"]["name"], al.get("id"), al.get("name"),
+            al.get("year"), al.get("type"))
+
+
 def sync_spotify():
-    """Taste = top artists (3 ranges), top tracks, saved albums/tracks, followed artists, recent plays.
-    Known albums (saved, or holding a saved/top track) are never recommended."""
-    artists, albums, ok = {}, {}, 0
+    """Taste = top artists/tracks of the last 4 weeks (all the web UI shows), followed artists and saved
+    albums, plus every liked song and playlist track ever seen (music_tracks: the browser only scrolls
+    Liked Songs down to the first known track and reads "Your Top Songs" playlists once).
+    Albums seen anywhere there are 'known' and never recommended."""
+    with db() as c:
+        known = [r[0] for r in c.execute("select uri from music_tracks where source = 'liked'")]
+        skip = [r[0] for r in c.execute("select distinct split_part(source, ':', 2) from music_tracks "
+                                        "where source like 'playlist:%' and list_name like 'Your Top Songs%'")]
+    h = spotify_harvest({"known_liked": known, "skip_playlists": skip})
+    new_liked = [t for t in h["liked"] if t["uri"] not in set(known)]
+    with db() as c, c.transaction(), c.cursor() as cur:
+        cur.executemany(f"insert into music_tracks({TRACK_COLS}) values (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                        "on conflict do nothing", [track_row(t, "liked") for t in h["liked"]])
+        for pl in h["playlists"]:   # playlists that were opened are replaced as a whole
+            cur.execute("delete from music_tracks where source = %s", ("playlist:" + pl["id"],))
+            cur.executemany(f"insert into music_tracks({TRACK_COLS}) values (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                            "on conflict do nothing",
+                            [track_row(t, "playlist:" + pl["id"], pl["name"]) for t in pl["tracks"]])
+        stored = [{"uri": r[0], "source": r[1], "list_name": r[2] or "", "artist": {"id": r[3], "name": r[4]},
+                   "album": {"id": r[5], "name": r[6], "year": r[7], "type": r[8], "artist": {"id": r[3], "name": r[4]}}
+                   if r[6] else None} for r in cur.execute(f"select {TRACK_COLS} from music_tracks")]
+    log(f"spotify: {len(new_liked)} new liked songs, {len(h['playlists'])} playlists read, "
+        f"{len(stored)} stored tracks")
+    artists, albums = {}, {}
 
     def add_artist(a, w, src):
-        if not a.get("id"):
+        if not a or not a.get("id"):
             return
-        x = artists.setdefault(a["id"], {"name": a["name"], "genres": [], "score": 0.0, "sources": set()})
+        x = artists.setdefault(a["id"], {"name": a["name"], "score": 0.0, "sources": set()})
         x["score"] += w
         x["sources"].add(src)
-        if a.get("genres"):
-            x["genres"] = a["genres"]
 
     def add_album(al, saved):
-        if not al or not al.get("artists") or al.get("album_type") == "compilation":
+        if not al or al.get("type") == "COMPILATION":
             return
-        k = akey(al["artists"][0]["name"], al["name"])
-        year = int(al["release_date"][:4]) if (al.get("release_date") or "")[:4].isdigit() else None
-        x = albums.setdefault(k, {"artist": al["artists"][0]["name"], "title": al["name"], "year": year,
+        k = akey(al["artist"]["name"], al["name"])
+        x = albums.setdefault(k, {"artist": al["artist"]["name"], "title": al["name"], "year": al.get("year"),
                                   "spotify_id": al.get("id"), "saved": False})
         x["saved"] |= saved
 
-    def section(name, fn):
-        nonlocal ok
-        try:
-            fn()
-            ok += 1
-            log(f"spotify {name} ok")
-        except Exception as e:  # noqa: BLE001
-            log(f"spotify {name} failed:", e)
+    def add_tracks(tracks, w, src):
+        for t in tracks:
+            add_artist(t["artist"], w, src)
+            add_album(t.get("album"), False)
 
-    def top_artists():
-        for rng, w in (("short_term", 3.0), ("medium_term", 2.0), ("long_term", 2.0)):
-            for i, a in enumerate(spotify_pages("/me/top/artists", {"time_range": rng, "limit": 50}, 100)):
-                add_artist(a, w * (1 - i / 150), "top-" + rng.split("_")[0])
-
-    def top_tracks():
-        for rng in ("short_term", "medium_term", "long_term"):
-            for t in spotify_pages("/me/top/tracks", {"time_range": rng, "limit": 50}, 100):
-                add_artist(t["artists"][0], 0.4, "top-track")
-                add_album(t.get("album"), False)
-
-    def saved_albums():
-        for it in spotify_pages("/me/albums", {"limit": 50}, 3000):
-            add_album(it["album"], True)
-            for a in it["album"]["artists"][:1]:
-                add_artist(a, 1.0, "saved-album")
-
-    def saved_tracks():
-        for it in spotify_pages("/me/tracks", {"limit": 50}, 5000):
-            add_artist(it["track"]["artists"][0], 0.15, "saved-track")
-            add_album(it["track"].get("album"), False)
-
-    def followed():
-        for a in spotify_pages("/me/following", {"type": "artist", "limit": 50}, 2000, key="artists"):
-            add_artist(a, 1.0, "followed")
-
-    def recent():
-        for it in spotify_pages("/me/player/recently-played", {"limit": 50}, 50):
-            add_artist(it["track"]["artists"][0], 0.2, "recent")
-
-    for name, fn in [("top artists", top_artists), ("top tracks", top_tracks), ("saved albums", saved_albums),
-                     ("saved tracks", saved_tracks), ("followed", followed), ("recently played", recent)]:
-        section(name, fn)
-    if not ok or not artists:
-        raise RuntimeError("Spotify sync got nothing (session expired? run `music_picks.py login`)")
+    n = len(h["top_artists"])
+    for i, a in enumerate(h["top_artists"]):
+        add_artist(a, 4.0 * (1 - i / (n + 10)), "top-month")
+    add_tracks(h["top_tracks"], 0.8, "top-track")
+    for a in h["library_artists"]:
+        add_artist(a, 2.0, "followed")
+    for al in h["library_albums"]:
+        add_artist(al["artist"], 1.5, "saved-album")
+        add_album(al, True)
+    add_tracks([t for t in stored if t["source"] == "liked"], 0.3, "liked")
+    add_tracks([t for t in stored if t["list_name"].startswith("Your Top Songs")], 0.3, "top-songs-year")
+    add_tracks([t for t in stored if t["source"].startswith("playlist:")
+                and not t["list_name"].startswith("Your Top Songs")], 0.2, "playlist")
+    if not h["top_artists"] and not stored:
+        raise RuntimeError("Spotify gave neither top artists nor liked songs (session expired? run `music_picks.py login`)")
     with db() as c, c.cursor() as cur:
         cur.execute("update music_artists set score = 0")
         cur.executemany(
-            "insert into music_artists(spotify_id, name, genres, score, sources) values (%s,%s,%s,%s,%s) "
-            "on conflict (spotify_id) do update set name=excluded.name, "
-            "genres=coalesce(nullif(excluded.genres, '{}'), music_artists.genres), score=excluded.score, "
+            "insert into music_artists(spotify_id, name, score, sources) values (%s,%s,%s,%s) "
+            "on conflict (spotify_id) do update set name=excluded.name, score=excluded.score, "
             "sources=excluded.sources, updated_at=now()",
-            [(i, a["name"], a["genres"], round(a["score"], 3), sorted(a["sources"])) for i, a in artists.items()])
+            [(i, a["name"], round(a["score"], 3), sorted(a["sources"])) for i, a in artists.items()])
         cur.executemany(
             "insert into music_albums(key, artist, title, year, spotify_id, saved) values (%s,%s,%s,%s,%s,%s) "
             "on conflict (key) do update set saved = music_albums.saved or excluded.saved, updated_at=now()",
@@ -289,8 +250,8 @@ def sync_spotify():
 
 def load_taste():
     with db() as c:
-        artists = [{"id": r[0], "name": r[1], "genres": r[2] or [], "score": r[3], "sources": r[4] or []}
-                   for r in c.execute("select spotify_id, name, genres, score, sources from music_artists "
+        artists = [{"id": r[0], "name": r[1], "genres": [], "score": r[2], "sources": r[3] or []}
+                   for r in c.execute("select spotify_id, name, score, sources from music_artists "
                                       "order by score desc")]
         albums = {r[0]: {"artist": r[1], "title": r[2], "year": r[3], "saved": r[4]}
                   for r in c.execute("select key, artist, title, year, saved from music_albums")}
@@ -299,8 +260,8 @@ def load_taste():
 
 def load_history():
     with db() as c:
-        return [{"mbid": r[0], "artist": r[1], "title": r[2], "year": r[3]}
-                for r in c.execute("select mbid, artist, title, year from music_sent order by sent_at")]
+        return [{"mbid": r[0], "artist": r[1], "title": r[2], "year": r[3], "facet": r[4]}
+                for r in c.execute("select mbid, artist, title, year, facet from music_sent order by sent_at")]
 
 
 # ---------------------------------------------------------------- Claude
@@ -326,7 +287,11 @@ def run_claude(prompt, system=None):
         raise ClaudeLimit(meta.get("result", "usage limit"))
     if out.returncode != 0 or meta.get("is_error") or "result" not in meta:
         raise RuntimeError(f"claude failed: {out.stderr[-2000:]} {out.stdout[-2000:]}")
-    return json.loads(re.search(r"\[.*\]", meta["result"], re.S).group(0))
+    m = re.search(r"\[.*\]", meta["result"], re.S)
+    try:
+        return json.loads(m.group(0))
+    except (AttributeError, ValueError):
+        raise RuntimeError(f"claude returned no valid JSON array: {meta['result'][:500]}") from None
 
 
 # ---------------------------------------------------------------- Lidarr
@@ -357,7 +322,7 @@ def lookup_album(artist, title, year=None):
 
 def lookup_mbid(mbid):
     res = lidarr("GET", "/album/lookup?term=" + urllib.parse.quote("lidarr:" + mbid)) or []
-    return next((a for a in res if a["foreignAlbumId"] == mbid), res[0] if res else None)
+    return next((a for a in res if a["foreignAlbumId"] == mbid), None)
 
 
 def lidarr_album(mbid):
@@ -388,6 +353,34 @@ def add_to_lidarr(mbid):
     return lidarr("POST", "/album", a)
 
 
+DOWNLOADS = STATE / "downloads.json"
+
+
+_dl_lock = threading.Lock()
+
+
+def mark_download(mbid):
+    try:
+        with _dl_lock:
+            try:
+                d = json.loads(DOWNLOADS.read_text()) if DOWNLOADS.exists() else {}
+            except ValueError:
+                d = {}
+            d[mbid] = time.time()
+            tmp = DOWNLOADS.with_suffix(".tmp")
+            tmp.write_text(json.dumps(d))
+            tmp.replace(DOWNLOADS)
+    except OSError as e:
+        log("downloads.json write failed:", e)
+
+
+def download_age(mbid):
+    try:
+        return time.time() - json.loads(DOWNLOADS.read_text()).get(mbid, 0)
+    except (OSError, ValueError):
+        return 1e9
+
+
 def album_tracks(a):
     rel = next((r for r in a.get("releases") or [] if r.get("monitored")), None) or (a.get("releases") or [{}])[0]
     return rel.get("trackCount") or 0
@@ -395,6 +388,8 @@ def album_tracks(a):
 
 # ---------------------------------------------------------------- links
 def sign(mbid, exp):
+    if len(CFG.get("LINK_SECRET", "")) < 32:
+        raise RuntimeError("LINK_SECRET missing or shorter than 32 chars")
     return hmac.new(CFG["LINK_SECRET"].encode(), f"{mbid}:{exp}".encode(), hashlib.sha256).hexdigest()[:24]
 
 
@@ -488,9 +483,16 @@ def send_email(subject, html_body, text_body):
     msg["Message-ID"] = make_msgid(domain=CFG["MAIL_FROM"].rsplit("@", 1)[-1].strip(">"))
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
-    with smtplib.SMTP_SSL(CFG["SMTP_HOST"], int(CFG["SMTP_PORT"]), timeout=60) as s:
-        s.login(CFG["SMTP_USER"], CFG["SMTP_PASSWORD"].replace(" ", ""))
-        s.send_message(msg)
+    accepted = False
+    try:
+        with smtplib.SMTP_SSL(CFG["SMTP_HOST"], int(CFG["SMTP_PORT"]), timeout=60) as s:
+            s.login(CFG["SMTP_USER"], CFG["SMTP_PASSWORD"].replace(" ", ""))
+            s.send_message(msg)
+            accepted = True
+    except Exception as e:  # noqa: BLE001
+        if not accepted:
+            raise
+        log("SMTP error after the message was accepted (ignored):", e)
     log("email sent to", rcpts)
     return rcpts
 
@@ -523,7 +525,6 @@ def write_metrics(ok):
 
 
 def cmd_pick(dry_run=False):
-    sync_spotify()
     artists, albums = load_taste()
     history = load_history()
     log(f"artists: {len(artists)}, known albums: {len(albums)}, sent before: {len(history)}")
@@ -539,21 +540,37 @@ def cmd_pick(dry_run=False):
     out = STATE / "last_email.html"
     out.write_text(body)
     out.chmod(0o600)
-    subject = f"{len(picks)} albums today: " + " · ".join(f"{p['artist']} — {p['title']}" for p in picks[:3])
+    subject = f"{len(picks)} albums today: " + " · ".join(f"{p['artist']} — {p['title']}" for p in picks[:3]) + (
+        " …" if len(picks) > 3 else "")
     log(subject)
-    if dry_run or not CFG.get("SMTP_PASSWORD"):
-        log("dry run / no SMTP_PASSWORD: saved to", out)
+    if dry_run:
+        log("dry run: saved to", out)
         return
-    rcpts = send_email(subject, body, render_text(picks))
-    with db() as c, c.cursor() as cur:
+    if not CFG.get("SMTP_PASSWORD"):
+        raise SystemExit("SMTP_PASSWORD not set: nothing sent")
+    rcpts = [r.strip() for r in CFG.get("RECIPIENTS", "").split(",") if r.strip()]
+    # record first: a DB hiccup after a sent email would otherwise let the same albums go out again
+    with db() as c, c.transaction(), c.cursor() as cur:
         cur.executemany(
             "insert into music_sent(batch, mbid, artist, title, year, facet, why, genres, known_artist, recipients) "
-            "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id",
             [(today, p["mbid"], p["artist"], p["title"], p["year"], p.get("facet"), p["why"], p["genres"],
-              p.get("known_artist"), rcpts) for p in picks])
+              p.get("known_artist"), rcpts) for p in picks], returning=True)
+        ids = []
+        while True:
+            ids += [r[0] for r in cur.fetchall()]
+            if not cur.nextset():
+                break
+    try:
+        send_email(subject, body, render_text(picks))
+    except Exception:
+        with db() as c:
+            c.execute("delete from music_sent where id = any(%s)", (ids,))
+        raise
 
 
 def cmd_pick_with_retry(dry_run=False, tries=17, wait_min=30):
+    sync_spotify()   # once: retries after a Claude usage limit don't scrape Spotify again
     for i in range(tries):
         try:
             return cmd_pick(dry_run)
@@ -618,12 +635,7 @@ def album_status(al):
         return "".join(bars) + (f'<div class="m">{have}/{total} tracks imported</div>' if have else ""), True
     if have:
         return f'<div class="s">{have}/{total} tracks imported, looking for the rest…</div>', True
-    added = (al.get("artist") or {}).get("added") or ""
-    try:
-        age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(added.replace("Z", "+00:00"))).total_seconds()
-    except ValueError:
-        age = 0
-    if age < 1800:
+    if download_age(al["foreignAlbumId"]) < 1800:
         return ('<div class="s">Searching Soulseek and torrent trackers…</div>'
                 '<div class="m">Soulseek is checked every 5 minutes; this page refreshes by itself.</div>'), True
     return ('<div class="s">Not found yet.</div>'
@@ -692,6 +704,7 @@ class Handler(BaseHTTPRequestHandler):
             al = lidarr_album(mbid)
             if not (al and al.get("monitored")):
                 al = add_to_lidarr(mbid)
+                mark_download(mbid)
                 log("added to lidarr:", (al.get("artist") or {}).get("artistName"), "—", al.get("title"))
                 event(mbid, "download", title=al.get("title"))
             self.reply(303, "", headers={"Location": self.path})
@@ -701,6 +714,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def cmd_serve():
+    sign("check", 0)   # fail at startup, not per request, if LINK_SECRET is bad
     port = int(CFG["WEB_PORT"])
     log("listening on 127.0.0.1:%d" % port)
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()

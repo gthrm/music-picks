@@ -43,7 +43,7 @@ services:
     image: mrusse08/soularr:latest
     container_name: soularr
     restart: unless-stopped
-    user: "1002:1000"   # own ./soularr, group-write to /media/slskd
+    user: "1000:1000"   # same user as slskd: it must move the files slskd wrote; ./soularr via ACL
     environment: [TZ=Europe/Berlin, SCRIPT_INTERVAL=300, WEBUI_ENABLED=false]
     volumes:
       - ./soularr:/data
@@ -54,6 +54,14 @@ services:
     depends_on: [lidarr, slskd]
     networks:
       media: {ipv4_address: 172.31.77.15}
+
+  flaresolverr:   # solves Cloudflare challenges for Prowlarr (RuTracker, 1337x, …)
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    environment: [TZ=Europe/Berlin, LOG_LEVEL=info]
+    networks:
+      media: {ipv4_address: 172.31.77.16}
 
 networks:
   media: {external: true}
