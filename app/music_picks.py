@@ -150,9 +150,17 @@ def slskd(path):
 VENV_PY = ROOT / ".venv" / "bin" / "python"
 
 
+SPOTIFY_STATE = {"ok": None}   # session state of the last harvest, for the metrics file
+
+
 def spotify_harvest(hint):
+    env = dict(os.environ)
+    for k in ("SPOTIFY_EMAIL", "SPOTIFY_PASSWORD"):   # optional auto-login when the session expired
+        if CFG.get(k):
+            env[k] = CFG[k]
     out = subprocess.run([str(VENV_PY), "-I", str(ROOT / "app" / "spotify_browser.py"), "harvest"],
-                         input=json.dumps(hint), capture_output=True, text=True, timeout=1800)
+                         input=json.dumps(hint), capture_output=True, text=True, timeout=1800, env=env)
+    SPOTIFY_STATE["ok"] = "SPOTIFY_SESSION_EXPIRED" not in out.stderr
     for line in out.stderr.strip().splitlines()[-6:]:
         log("spotify:", line)
     if out.returncode != 0:
@@ -350,7 +358,14 @@ def add_to_lidarr(mbid):
         a["artist"].update(qualityProfileId=int(CFG["LIDARR_PROFILE"]), metadataProfileId=int(CFG["LIDARR_METADATA"]),
                            rootFolderPath="/media/music", monitored=True, monitorNewItems="none",
                            addOptions={"monitor": "none", "searchForMissingAlbums": False})
-    return lidarr("POST", "/album", a)
+    added = lidarr("POST", "/album", a)
+    # Lidarr creates the artist unmonitored with monitor "none", which locks every other album's monitor
+    # toggle in the UI. Keep the artist monitored; monitorNewItems "none" stops it grabbing anything else.
+    artist = lidarr("GET", f"/artist/{added['artistId']}")
+    if not artist["monitored"]:
+        artist["monitored"] = True
+        lidarr("PUT", f"/artist/{artist['id']}", artist)
+    return added
 
 
 DOWNLOADS = STATE / "downloads.json"
@@ -497,18 +512,23 @@ def send_email(subject, html_body, text_body):
     return rcpts
 
 
-def write_metrics(ok):
+def write_metrics(ok, spotify_ok=None):
     """node_exporter textfile metrics for Grafana alerts (METRICS_FILE; unset = off)."""
     path = os.environ.get("METRICS_FILE") or CFG.get("METRICS_FILE")
     if not path:
         return
     path = pathlib.Path(path)
-    last = 0
+    last, sp = 0, 1
     try:
-        m = re.search(r"^music_picks_last_success_timestamp_seconds (\S+)$", path.read_text(), re.M)
+        text = path.read_text()
+        m = re.search(r"^music_picks_last_success_timestamp_seconds (\S+)$", text, re.M)
         last = float(m.group(1)) if m else 0
+        m = re.search(r"^music_picks_spotify_session_ok (\S+)$", text, re.M)
+        sp = int(float(m.group(1))) if m else 1
     except OSError:
         pass
+    if spotify_ok is not None:
+        sp = 1 if spotify_ok else 0
     now = time.time()
     if ok:
         last = now
@@ -519,7 +539,10 @@ def write_metrics(ok):
                    "# HELP music_picks_last_run_ok 1 if the last daily run sent the email, else 0.\n"
                    "# TYPE music_picks_last_run_ok gauge\n"
                    f"music_picks_last_run_ok {1 if ok else 0}\n"
-                   f"music_picks_last_run_timestamp_seconds {now:.0f}\n")
+                   f"music_picks_last_run_timestamp_seconds {now:.0f}\n"
+                   "# HELP music_picks_spotify_session_ok 1 if the headless browser is logged in to Spotify.\n"
+                   "# TYPE music_picks_spotify_session_ok gauge\n"
+                   f"music_picks_spotify_session_ok {sp}\n")
     tmp.chmod(0o644)
     tmp.replace(path)
 
@@ -734,9 +757,9 @@ if __name__ == "__main__":
             cmd_pick_with_retry(dry_run=dry)
         except BaseException:
             if not dry:
-                write_metrics(ok=False)
+                write_metrics(ok=False, spotify_ok=SPOTIFY_STATE["ok"])
             raise
         if not dry:
-            write_metrics(ok=True)
+            write_metrics(ok=True, spotify_ok=SPOTIFY_STATE["ok"])
     else:
         print(__doc__)

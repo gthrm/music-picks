@@ -8,6 +8,8 @@ The browser profile (cookies) lives in state/browser. Nothing calls Spotify's AP
 opened like a person would and the JSON the web player itself fetches is read.
 """
 import json
+import os
+import re
 import pathlib
 import sys
 import time
@@ -33,6 +35,43 @@ def launch(p, debug=False):
 
 def logged_in(ctx):
     return any(c["name"] == "sp_dc" and c["value"] for c in ctx.cookies("https://open.spotify.com"))
+
+
+def auto_login(ctx):
+    """Log in with SPOTIFY_EMAIL / SPOTIFY_PASSWORD (from the environment, never argv) when the saved
+    session is gone. Handles both Spotify login flows (email+password on one page, or email → 'Log in
+    with a password'). Returns True if logged in; a captcha or emailed code makes it give up."""
+    email, pw = os.environ.get("SPOTIFY_EMAIL"), os.environ.get("SPOTIFY_PASSWORD")
+    if not email or not pw:
+        return False
+    page = ctx.new_page()
+    try:
+        page.goto("https://accounts.spotify.com/en/login?continue=https%3A%2F%2Fopen.spotify.com%2F",
+                  wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+        page.fill("#login-username, input[name=username]", email)
+        if not page.locator("#login-password").is_visible():
+            page.click("button[data-testid=login-button], #login-button")
+            page.wait_for_timeout(3000)
+            pw_link = page.get_by_role("button", name=re.compile("password", re.I))
+            if pw_link.count():
+                pw_link.first.click()
+                page.wait_for_timeout(2000)
+        page.fill("#login-password, input[type=password]", pw)
+        page.click("button[data-testid=login-button], #login-button")
+        for _ in range(30):
+            if logged_in(ctx):
+                page.wait_for_timeout(3000)
+                log("auto-login ok")
+                return True
+            page.wait_for_timeout(1000)
+        log("auto-login failed: no session after submitting (captcha or emailed code?)")
+        return False
+    except Exception as e:  # noqa: BLE001
+        log("auto-login failed:", str(e).splitlines()[0][:200])
+        return False
+    finally:
+        page.close()
 
 
 def cmd_login(minutes=30):
@@ -219,8 +258,9 @@ def cmd_harvest():
     with sync_playwright() as p:
         ctx = launch(p)
         try:
-            if not logged_in(ctx):
-                raise SystemExit("not logged in to Spotify: run `music_picks.py login`")
+            if not logged_in(ctx) and not auto_login(ctx):
+                raise SystemExit("SPOTIFY_SESSION_EXPIRED: not logged in to Spotify and auto-login "
+                                 "unavailable/failed: run `music_picks.py login`")
             page = ctx.new_page()
             home = visit(page, "https://open.spotify.com/", "home")
             me = next((js["data"]["me"]["profile"] for op, js in home if op == "profileAttributes"), None)
