@@ -350,7 +350,8 @@ def add_to_lidarr(mbid):
     a = lookup_mbid(mbid)
     if not a:
         raise RuntimeError(f"album {mbid} not found in metadata")
-    a.update(monitored=True, addOptions={"searchForNewAlbum": True})
+    # anyReleaseOk: a deluxe/regional edition is fine, otherwise imports fail with "release not requested"
+    a.update(monitored=True, anyReleaseOk=True, addOptions={"searchForNewAlbum": True})
     existing = lidarr("GET", f"/artist?mbId={a['artist']['foreignArtistId']}") or []
     if existing:
         a["artist"], a["artistId"] = existing[0], existing[0]["id"]
