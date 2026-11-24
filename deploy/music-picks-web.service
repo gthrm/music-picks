@@ -1,0 +1,14 @@
+[Unit]
+Description=music-picks download-link and Spotify-callback handler
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=user
+WorkingDirectory=/home/user/music-picks
+ExecStart=/usr/bin/python3 -I /home/user/music-picks/app/music_picks.py serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

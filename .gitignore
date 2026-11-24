@@ -1,0 +1,12 @@
+# secrets & local config
+.env
+state/
+
+# container configs (API keys, DBs, logs)
+lidarr/
+slskd/
+soularr/
+
+__pycache__/
+*.pyc
+.venv/

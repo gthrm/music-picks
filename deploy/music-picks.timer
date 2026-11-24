@@ -1,0 +1,9 @@
+[Unit]
+Description=music-picks every day at 10:00 Europe/Berlin
+
+[Timer]
+OnCalendar=*-*-* 10:00:00 Europe/Berlin
+Persistent=true
+
+[Install]
+WantedBy=timers.target
