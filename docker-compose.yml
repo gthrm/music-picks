@@ -26,6 +26,8 @@ services:
       - SLSKD_REMOTE_CONFIGURATION=false
       - SLSKD_SLSK_USERNAME=${SLSK_USERNAME:-}
       - SLSKD_SLSK_PASSWORD=${SLSK_PASSWORD:-}
+      - SLSKD_USERNAME=${SLSKD_WEB_USERNAME:-slskd}   # web UI login (slskd.home.local)
+      - SLSKD_PASSWORD=${SLSKD_WEB_PASSWORD:-slskd}
       - SLSKD_DOWNLOADS_DIR=/media/slskd
       - SLSKD_INCOMPLETE_DIR=/media/slskd/incomplete
       - SLSKD_SHARED_DIR=/media/music

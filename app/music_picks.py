@@ -243,7 +243,7 @@ def sync_spotify():
                 and not t["list_name"].startswith("Your Top Songs")], 0.2, "playlist")
     if not h["top_artists"] and not stored:
         raise RuntimeError("Spotify gave neither top artists nor liked songs (session expired? run `music_picks.py login`)")
-    with db() as c, c.cursor() as cur:
+    with db() as c, c.transaction(), c.cursor() as cur:   # reset + upsert atomically
         cur.execute("update music_artists set score = 0")
         cur.executemany(
             "insert into music_artists(spotify_id, name, score, sources) values (%s,%s,%s,%s) "
@@ -311,17 +311,41 @@ def cover_url(a):
     return a.get("remoteCover") or ""
 
 
+EDITION_SEPARATORS = (":", " - ", " – ", "(", "[")
+
+
+def title_matches(found, wanted):
+    """Exact normalized match, or one title is the other plus an edition/subtitle part that starts at a
+    separator in the original text ("Blue (Deluxe)", "Blue: Live"); "Blue" never matches "Blue Train"."""
+    t, want = norm(found), norm(wanted)
+    if not t or not want:
+        return False
+    if t == want:
+        return True
+    for longer, shorter in ((found, wanted), (wanted, found)):
+        for sep in EDITION_SEPARATORS:
+            head = longer.split(sep, 1)[0] if sep in longer else None
+            if head is not None and norm(head) == norm(shorter):
+                return True
+    return False
+
+
 def lookup_album(artist, title, year=None):
+    if not norm(title):
+        return None
     res = lidarr("GET", "/album/lookup?term=" + urllib.parse.quote(f"{artist} {title}")) or []
     good = []
     for a in res:
         if norm(a["artist"]["artistName"]) != norm(artist):
             continue
-        t, want = norm(a["title"]), norm(title)
-        if not t or not (t == want or t.startswith(want) or want.startswith(t)):
+        if not title_matches(a["title"], title):
             continue
         y = int((a.get("releaseDate") or "0")[:4] or 0)
-        if year and y and abs(y - int(year)) > 2:
+        try:
+            year = int(year) if year else None
+        except (TypeError, ValueError):
+            year = None
+        if year and y and abs(y - year) > 2:
             continue
         good.append(a)
     good.sort(key=lambda a: (a.get("albumType") not in ("Album", "EP"), norm(a["title"]) != norm(title),
@@ -339,11 +363,19 @@ def lidarr_album(mbid):
     return r[0] if r else None
 
 
+def ensure_artist_monitored(artist_id):
+    artist = lidarr("GET", f"/artist/{artist_id}")
+    if not artist["monitored"]:
+        artist["monitored"] = True   # monitorNewItems stays as is ("none" for artists added here)
+        lidarr("PUT", f"/artist/{artist['id']}", artist)
+
+
 def add_to_lidarr(mbid):
     """Add the album (artist unmonitored for anything else) and search. Soularr then tries Soulseek,
     Lidarr tries torrents via Prowlarr."""
     al = lidarr_album(mbid)
     if al:
+        ensure_artist_monitored(al["artistId"])   # wanted/missing (Soularr, watcher) needs artist AND album
         if not al["monitored"]:
             lidarr("PUT", "/album/monitor", {"albumIds": [al["id"]], "monitored": True})
         lidarr("POST", "/command", {"name": "AlbumSearch", "albumIds": [al["id"]]})
@@ -742,6 +774,64 @@ ARTIST_SEARCH_HOURS = 12   # at most one artist-level search per artist in this 
 WATCH_GRACE_MIN = 20       # give the album's own search and Soularr a head start
 
 
+STALL_HOURS = 2
+STALL_MIN_PROGRESS = 0.02   # less than 2% of the release in STALL_HOURS -> stalled (same rule as movie-picks)
+
+
+def actively_downloading(r):
+    """Lidarr queue row of a torrent that should be making progress: downloading, or stalled with no
+    connections (status 'warning'). Queued, paused, completed/importing rows are not judged."""
+    status = str(r.get("status") or "").lower()
+    if status == "downloading":
+        return True
+    msg = " ".join([str(r.get("errorMessage") or "")] +
+                   [m for s in r.get("statusMessages") or [] for m in s.get("messages") or []]).lower()
+    return status == "warning" and "stalled" in msg and r.get("trackedDownloadState") in (None, "downloading")
+
+
+def replace_stalled(queue):
+    """Torrents that barely moved in STALL_HOURS: blocklist the release, Lidarr searches for another.
+    Several queue rows can share one torrent (a discography pack covers several albums)."""
+    torrents, albums_of = {}, {}
+    for r in queue:
+        if r.get("downloadId") and r.get("size") and "torrent" in str(r.get("protocol", "")).lower():
+            torrents.setdefault(r["downloadId"], r)
+            albums_of.setdefault(r["downloadId"], set()).add(r.get("albumId"))
+    removed = set()
+    if not torrents:
+        return removed   # nothing downloading: don't wake the database
+    with db() as c:
+        c.execute("""create table if not exists music_dl_progress (
+            download_id text primary key, title text, size bigint,
+            checkpoint_at timestamptz not null, checkpoint_left bigint not null)""")
+        c.execute("delete from music_dl_progress where not (download_id = any(%s))", (list(torrents),))
+        for did, r in torrents.items():
+            size, left = r["size"], r.get("sizeleft") or 0
+            row = c.execute("select checkpoint_at, checkpoint_left from music_dl_progress where download_id=%s",
+                            (did,)).fetchone()
+            if not row:
+                c.execute("insert into music_dl_progress values (%s,%s,%s,now(),%s)", (did, r.get("title"), size, left))
+                continue
+            at, cleft = row
+            if not actively_downloading(r):   # queued/paused/importing: not the torrent's fault, restart the clock
+                c.execute("update music_dl_progress set checkpoint_at=now(), checkpoint_left=%s where download_id=%s",
+                          (left, did))
+                continue
+            hours = (dt.datetime.now(dt.timezone.utc) - at).total_seconds() / 3600
+            if hours < STALL_HOURS:
+                continue
+            if left == 0 or cleft - left >= STALL_MIN_PROGRESS * size:
+                c.execute("update music_dl_progress set checkpoint_at=now(), checkpoint_left=%s where download_id=%s",
+                          (left, did))
+                continue
+            log(f"stalled {hours:.1f}h: {r.get('title')} — blocklisting, Lidarr searches another release")
+            lidarr("DELETE", f"/queue/{r['id']}?removeFromClient=true&blocklist=true&skipRedownload=false")
+            event(did, "stalled", release=r.get("title"), hours=round(hours, 1))
+            c.execute("delete from music_dl_progress where download_id=%s", (did,))
+            removed |= albums_of[did]
+    return removed   # albumIds Lidarr is already re-searching (skipRedownload=false)
+
+
 def cmd_watch():
     """Albums that are wanted but not downloading: run an artist-level search. Lidarr's album search
     ignores discography packs, which is often the only torrent of an older album; artist search takes
@@ -754,8 +844,10 @@ def cmd_watch():
         except (AttributeError, ValueError):
             return 1e9
 
+    queue = (lidarr("GET", "/queue?pageSize=1000") or {}).get("records", [])
+    researching = replace_stalled(queue)   # Lidarr already searches these again: no artist search this run
     wanted = (lidarr("GET", "/wanted/missing?pageSize=1000&monitored=true&includeArtist=true") or {}).get("records", [])
-    queued = {r.get("albumId") for r in (lidarr("GET", "/queue?pageSize=1000") or {}).get("records", [])}
+    queued = {r.get("albumId") for r in (lidarr("GET", "/queue?pageSize=1000") or {}).get("records", [])} | researching
     todo = {}
     for a in wanted:
         if a["id"] in queued or age_s(a.get("releaseDate")) < 0:   # downloading, or not released yet

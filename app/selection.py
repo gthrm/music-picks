@@ -31,6 +31,19 @@ PERSONAS = [
 ]
 
 
+def as_year(v):
+    """Claude's or Lidarr's year as an int, 0 when it isn't one."""
+    try:
+        y = int(str(v).strip()[:4])
+        return y if 1000 <= y <= 2999 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def release_year(a):
+    return as_year((a.get("releaseDate") or "")[:4])
+
+
 def ensure_tables(c):
     c.execute("""create table if not exists music_facets (
         id serial primary key, name text not null, artists text[] not null,
@@ -54,7 +67,7 @@ def get_facets(artists):
         if row:
             old = set((row[1] or "").split("\x1f"))
             fresh = (dt.datetime.now(dt.timezone.utc) - row[0]).days < FACET_MAX_AGE_DAYS
-            if fresh and len(old & set(signature)) >= 28:
+            if fresh and signature and len(old & set(signature)) >= 0.7 * len(signature):
                 return [{"name": r[0], "artists": r[1]}
                         for r in c.execute("select name, artists from music_facets where created_at=%s", (row[0],))]
     listing = "\n".join(describe(a) for a in top)
@@ -68,11 +81,15 @@ different from each other as possible
 (genre, era, region, mood, energy). Every artist goes into exactly one facet; each facet needs at least 3 artists.
 Facet names: 2-4 words, concrete (e.g. "Dusty 70s Soul", "Nordic Ambient Techno").
 Respond with ONLY JSON: [{{"facet": "name", "artists": ["Artist", ...]}}, ...]""")
+    bad = [f for f in facets if not (isinstance(f, dict) and isinstance(f.get("facet"), str) and f["facet"].strip()
+                                     and isinstance(f.get("artists"), list) and f["artists"])]
+    if bad or not facets:
+        raise RuntimeError(f"claude returned malformed facets: {str(bad or facets)[:300]}")
     now = dt.datetime.now(dt.timezone.utc)
-    with mp.db() as c:
+    with mp.db() as c, c.transaction():   # all or nothing: a partial set would be cached for 3 weeks
         for f in facets:
             c.execute("insert into music_facets(name, artists, top_signature, created_at) values (%s,%s,%s,%s)",
-                      (f["facet"], f["artists"], "\x1f".join(signature), now))
+                      (f["facet"], [str(x) for x in f["artists"]], "\x1f".join(signature), now))
     mp.log(f"facets regenerated: {[f['facet'] for f in facets]}")
     return [{"name": f["facet"], "artists": f["artists"]} for f in facets]
 
@@ -179,10 +196,10 @@ def choose(artists, albums, history):
         return a, "ok"
 
     def fits(a):
-        dec = int((a.get("releaseDate") or "0")[:4] or 0) // 10
+        dec = (release_year(a) or 0) // 10
         g = mp.norm((a.get("genres") or ["?"])[0])
         known = mp.norm(a["artist"]["artistName"]) in known_artists
-        return (sum(p["year"] // 10 == dec for p in picks if p["year"]) < cap
+        return (sum(as_year(p["year"]) // 10 == dec for p in picks if as_year(p["year"])) < cap
                 and sum(mp.norm((p["genres"] or ["?"])[0]) == g for p in picks) < cap
                 and not (known and sum(p["known_artist"] for p in picks) >= max_known))
 
@@ -215,7 +232,7 @@ def choose(artists, albums, history):
         a, cand, li = choice
         logrows[li][8] = True
         picks.append({"mbid": a["foreignAlbumId"], "artist": a["artist"]["artistName"], "title": a["title"],
-                      "year": int((a.get("releaseDate") or "0")[:4] or 0) or cand.get("year"),
+                      "year": release_year(a) or as_year(cand.get("year")) or None,
                       "type": a.get("albumType"), "facet": g.get("facet", ""), "why": cand.get("why", ""),
                       "genres": [x for x in (a.get("genres") or [])][:3], "cover": mp.cover_url(a),
                       "tracks": mp.album_tracks(a), "duration": a.get("duration") or 0,

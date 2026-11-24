@@ -244,6 +244,18 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+def profile_of(responses):
+    for op, js in responses:
+        if op == "profileAttributes":
+            try:
+                prof = js["data"]["me"]["profile"]
+            except (KeyError, TypeError):
+                continue
+            if isinstance(prof, dict) and prof.get("username"):
+                return prof
+    return None
+
+
 def cmd_harvest():
     """Everything the taste sync needs, as JSON on stdout. Only reads what the web player itself shows.
     stdin (optional JSON): {"known_liked": [track uris], "skip_playlists": [playlist ids]} from the DB:
@@ -263,9 +275,13 @@ def cmd_harvest():
                                  "unavailable/failed: run `music_picks.py login`")
             page = ctx.new_page()
             home = visit(page, "https://open.spotify.com/", "home")
-            me = next((js["data"]["me"]["profile"] for op, js in home if op == "profileAttributes"), None)
+            me = profile_of(home)
+            if not me and auto_login(ctx):   # cookie present but session dead server-side
+                home = visit(page, "https://open.spotify.com/", "home")
+                me = profile_of(home)
             if not me:
-                raise SystemExit("no profile in the web player (session expired? run `music_picks.py login`)")
+                raise SystemExit("SPOTIFY_SESSION_EXPIRED: no profile in the web player and auto-login "
+                                 "unavailable/failed: run `music_picks.py login`")
             user = me["username"]
             me_uri = f"spotify:user:{user}"
 
@@ -314,9 +330,7 @@ def cmd_harvest():
             res["top_tracks"] = tracks_in([(op, js) for op, js in top_t if "top" in op.lower()]) or []
             liked = visit(page, "https://open.spotify.com/collection/tracks", "liked", 60, stop=known_liked)
             res["liked"] = tracks_in([(op, js) for op, js in liked if op.startswith("fetch")])
-            for pid, name in playlists[:25]:
-                if pid in skip:
-                    continue
+            for pid, name in [x for x in playlists if x[0] not in skip][:25]:
                 got_pl = visit(page, f"https://open.spotify.com/playlist/{pid}", name, 15)
                 tr = tracks_in([(op, js) for op, js in got_pl if op.startswith("fetchPlaylist")])
                 res["playlists"].append({"id": pid, "name": name, "tracks": tr})
